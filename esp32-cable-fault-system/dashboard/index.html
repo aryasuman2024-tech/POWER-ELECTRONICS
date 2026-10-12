@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Automated Cable Fault Detection & Localization Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="instrument-container">
+    <!-- Top Header -->
+    <header class="instrument-header">
+      <div class="header-title">
+        <h1>
+          ESP32 Cable Fault Localization System
+          <span class="tag">VIRTUAL INSTRUMENT</span>
+        </h1>
+        <p class="header-subtitle">
+          Automated Wheatstone Bridge Null Balancing &bull; Murray-Loop Localization &bull; Thermal Drift Compensation
+        </p>
+      </div>
+      <div class="header-controls">
+        <span id="mode-badge" class="tag">MODE: SOFTWARE SIMULATION</span>
+        <div id="status-pill" class="status-pill idle">IDLE</div>
+        <button id="btn-serial" class="btn" title="Connect physical ESP32 COM port using Web Serial">Connect ESP32</button>
+        <button id="btn-export" class="btn btn-primary">Export CSV</button>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <div class="dashboard-grid">
+      <!-- Left Panel: Test Rig Controls -->
+      <aside class="panel-card accent-border">
+        <div class="card-title">
+          <span>Test Rig Parameters</span>
+          <span style="font-size:0.75rem; color:var(--text-dim);">Vsupply: 3.3V</span>
+        </div>
+
+        <!-- Cable Length -->
+        <div class="control-group">
+          <div class="control-label">
+            <span>Cable Length (L)</span>
+            <span id="lbl-cable-len" class="val">10.0 m</span>
+          </div>
+          <input type="range" id="input-cable-len" min="2.0" max="100.0" step="1.0" value="10.0">
+        </div>
+
+        <!-- Fault Distance -->
+        <div class="control-group">
+          <div class="control-label">
+            <span>Simulated Fault Distance (Lf)</span>
+            <span id="lbl-fault-dist" class="val">4.0 m</span>
+          </div>
+          <input type="range" id="input-fault-dist" min="0.0" max="10.0" step="0.5" value="4.0">
+        </div>
+
+        <!-- Fault Resistance -->
+        <div class="control-group">
+          <div class="control-label">
+            <span>Fault Ground Resistance (Rf)</span>
+            <span id="lbl-fault-res" class="val">0.0 Ω</span>
+          </div>
+          <input type="range" id="input-fault-res" min="0.0" max="250.0" step="5.0" value="0.0">
+        </div>
+
+        <!-- Ambient Temperature -->
+        <div class="control-group">
+          <div class="control-label">
+            <span>Ambient / Cable Temp</span>
+            <span id="lbl-temp" class="val">28.5 °C</span>
+          </div>
+          <input type="range" id="input-temp" min="-10.0" max="80.0" step="0.5" value="28.5">
+        </div>
+
+        <!-- Conductor Material -->
+        <div class="control-group">
+          <label class="control-label" for="select-material">Conductor Material</label>
+          <select id="select-material">
+            <option value="copper">Annealed Copper (α = 0.00393/°C)</option>
+            <option value="aluminum">EC-Grade Aluminum (α = 0.00403/°C)</option>
+          </select>
+        </div>
+
+        <!-- Control Action Buttons -->
+        <div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">
+          <button id="btn-balance" class="btn btn-primary" style="font-size:0.95rem; padding:10px;">
+            ⚡ Start Auto-Balance
+          </button>
+          <button id="btn-relay" class="btn btn-danger">
+            Clear Fault (Relay OFF)
+          </button>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+            <button id="btn-pause" class="btn">Pause Sim</button>
+            <button id="btn-reset" class="btn">Reset All</button>
+          </div>
+        </div>
+
+        <!-- LED Status Annunciator Bank -->
+        <div class="card-title" style="margin-top:10px;">
+          <span>ESP32 Physical Status LEDs</span>
+        </div>
+        <div class="led-bank">
+          <div class="led-indicator">
+            <div id="led-green" class="led-lamp green"></div>
+            <span class="led-label">BALANCED (G21)</span>
+          </div>
+          <div class="led-indicator">
+            <div id="led-amber" class="led-lamp amber"></div>
+            <span class="led-label">SEARCHING (G19)</span>
+          </div>
+          <div class="led-indicator">
+            <div id="led-red" class="led-lamp red on"></div>
+            <span class="led-label">FAULT (G22)</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center Panel: Meters, Cable Map, Oscilloscopes -->
+      <main style="display:flex; flex-direction:column; gap:16px;">
+        <!-- Digital Meters Grid -->
+        <section class="meters-grid">
+          <!-- Bridge Imbalance Voltage -->
+          <div class="digital-meter">
+            <div class="meter-title">Bridge Imbalance (Vout)</div>
+            <div class="meter-value" id="val-vout">0.0 <span class="meter-unit">mV</span></div>
+            <div class="meter-sub">LM358 Diff Stage (Av = 1.0)</div>
+          </div>
+
+          <!-- Estimated Fault Distance -->
+          <div class="digital-meter">
+            <div class="meter-title">Estimated Fault Location</div>
+            <div class="meter-value green" id="val-dist-est">0.000 <span class="meter-unit">m</span></div>
+            <div class="meter-sub">Target Ref: <span id="val-dist-ref">4.000</span> m</div>
+          </div>
+
+          <!-- Absolute Error -->
+          <div class="digital-meter">
+            <div class="meter-title">Localization Error (ΔL)</div>
+            <div class="meter-value amber" id="val-err-abs">0.000 <span class="meter-unit">m</span></div>
+            <div class="meter-sub">Pct Error: <span id="val-err-pct">0.00</span> %</div>
+          </div>
+
+          <!-- Potentiometer Position -->
+          <div class="digital-meter">
+            <div class="meter-title">MCP4131 Wiper Tap</div>
+            <div class="meter-value" id="val-pot-pos">64 / 128</div>
+            <div class="meter-sub">Active R: <span id="val-pot-res">5075.0</span> Ω</div>
+          </div>
+        </section>
+
+        <!-- Interactive Cable Localization Map -->
+        <section class="cable-visualizer-container">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:0.85rem; font-weight:600; text-transform:uppercase; color:var(--text-muted);">
+              Underground Cable Fault Position Map (10-Segment Discrete Rig)
+            </span>
+            <span style="font-size:0.75rem; color:var(--accent-cyan); font-family:var(--font-mono);">
+              Node A [0.0m] &rarr; Far End [10.0m]
+            </span>
+          </div>
+          <div class="cable-line-display">
+            <div class="cable-track">
+              <div id="visual-track-faulted" class="cable-track-faulted" style="width: 40%;"></div>
+              <div id="visual-pin-marker" class="cable-pin" style="left: 40%;">
+                <div class="pin-marker"></div>
+                <div id="visual-pin-text" class="pin-label">Fault: 4.0m (Tap #4)</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Real-Time Waveform Oscilloscopes -->
+        <section class="charts-grid">
+          <div class="chart-card">
+            <header>
+              <span>Scope 1: Bridge Error Voltage Vdiff (±2.0 V Scale)</span>
+              <span style="color:var(--accent-cyan);">&bull; Null Band: ±50 mV</span>
+            </header>
+            <canvas id="canvas-voltage" class="scope-canvas" width="450" height="160"></canvas>
+          </div>
+
+          <div class="chart-card">
+            <header>
+              <span>Scope 2: Pot Resistance (Green) vs Cable (Amber)</span>
+              <span style="color:var(--accent-green);">&bull; 0 - 2000 Ω</span>
+            </header>
+            <canvas id="canvas-resistance" class="scope-canvas" width="450" height="160"></canvas>
+          </div>
+        </section>
+      </main>
+
+      <!-- Right Panel: Live Telemetry Stream & System Health -->
+      <aside class="panel-card">
+        <div class="card-title">
+          <span>Live CSV Telemetry</span>
+          <span style="font-size:0.75rem; color:var(--text-dim);">115200 Baud</span>
+        </div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+          <div class="digital-meter" style="padding:8px 10px;">
+            <div class="meter-title">Cable Temp</div>
+            <div class="meter-value" id="val-temp" style="font-size:1.2rem;">28.5 <span class="meter-unit">°C</span></div>
+          </div>
+          <div class="digital-meter" style="padding:8px 10px;">
+            <div class="meter-title">Search Steps</div>
+            <div class="meter-value" id="val-steps" style="font-size:1.2rem;">0</div>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Vout(V)</th>
+                <th>R2(Ω)</th>
+                <th>Lf(m)</th>
+                <th>Err(m)</th>
+                <th>Tap</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="table-body">
+              <!-- Dynamically populated rows -->
+            </tbody>
+          </table>
+        </div>
+
+        <div style="font-size:0.72rem; color:var(--text-dim); line-height:1.4;">
+          <strong>Hardware Port Note:</strong> When connecting a physical ESP32, plug in via USB at 115200 baud. The Web Serial stream automatically parses incoming CSV telemetry into this dashboard.
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script src="simulation_engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

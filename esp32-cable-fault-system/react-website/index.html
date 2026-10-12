@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Cable Fault Detection & Localization — Virtual Instrument</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 & ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel Standalone -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+    
+    :root {
+      --bg-dark: #0a0e17;
+      --card-bg: #111726;
+      --card-border: #1e293b;
+    }
+    
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg-dark);
+      color: #e2e8f0;
+      margin: 0;
+      padding: 0;
+    }
+
+    .font-mono {
+      font-family: 'JetBrains Mono', monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Subtle industrial styling */
+    .instrument-card {
+      background: #101626;
+      border: 1px solid #1e283d;
+      box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.5);
+    }
+
+    .instrument-display {
+      background: #090d16;
+      border: 1px solid #1a2234;
+    }
+
+    /* Steady, clean LED indicators (NO rapid flickering) */
+    .led-bulb {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      transition: background-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .led-green-on {
+      background-color: #10b981;
+      box-shadow: 0 0 10px #10b981;
+    }
+
+    .led-amber-on {
+      background-color: #f59e0b;
+      box-shadow: 0 0 10px #f59e0b;
+    }
+
+    .led-red-on {
+      background-color: #ef4444;
+      box-shadow: 0 0 10px #ef4444;
+    }
+
+    .led-off {
+      background-color: #1e293b;
+      box-shadow: none;
+    }
+
+    /* Smooth animated signal flow */
+    @keyframes wireSignal {
+      to {
+        stroke-dashoffset: -24;
+      }
+    }
+    .wire-pulse {
+      stroke-dasharray: 6, 6;
+      animation: wireSignal 1.2s linear infinite;
+    }
+  </style>
+</head>
+<body class="antialiased min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+    // Physical Constants
+    const COPPER_ALPHA = 0.00393;
+    const ALUM_ALPHA = 0.00403;
+    const BRIDGE_V = 3.3;
+    const R_TOP = 1000.0;
+    const POT_RAB = 10000.0;
+    const POT_RW = 75.0;
+
+    function App() {
+      // Test Rig Parameter State
+      const [cableLength, setCableLength] = useState(10.0);
+      const [faultTap, setFaultTap] = useState(4); // Tap 1 to 10
+      const [faultResistance, setFaultResistance] = useState(0.0); // Ohms
+      const [temperature, setTemperature] = useState(25.0); // °C
+      const [material, setMaterial] = useState('copper');
+      const [relayActive, setRelayActive] = useState(true);
+      const [precisionMode, setPrecisionMode] = useState('exact'); // 'exact' vs 'hardware128'
+      const [activeTab, setActiveTab] = useState('schematic'); // 'schematic' vs 'scopes'
+
+      // Instrument State
+      const [status, setStatus] = useState('IDLE'); // IDLE, SEARCHING, BALANCED
+      const [stepProgress, setStepProgress] = useState(0);
+      const [potResistance, setPotResistance] = useState(5000.0);
+      const [telemetryRecords, setTelemetryRecords] = useState([]);
+
+      // Canvas Refs
+      const canvasVRef = useRef(null);
+      const canvasRRef = useRef(null);
+      const scopeDataRef = useRef({ vDiff: [], rPot: [], rCable: [] });
+      const balanceTimerRef = useRef(null);
+
+      // ----------------------------------------------------------------------
+      // ELECTRICAL PHYSICS CALCULATIONS (Deterministic, Zero Jitter)
+      // ----------------------------------------------------------------------
+      const alpha = material === 'copper' ? COPPER_ALPHA : ALUM_ALPHA;
+      const tempFactor = 1.0 + alpha * (temperature - 25.0);
+      const rPerSegment = 100.0 * tempFactor;
+      const rCableTotal = 10.0 * rPerSegment;
+      const faultDistanceTarget = (faultTap / 10.0) * cableLength;
+
+      // Cable Equivalent Resistance from Node A to GND
+      const rCableGnd = useMemo(() => {
+        if (!relayActive) return rCableTotal;
+        const rFaulted = faultTap * rPerSegment;
+        const rRem = (10 - faultTap) * rPerSegment;
+        if (faultResistance <= 0.001) {
+          return rFaulted; // Bolted dead-short to GND
+        }
+        return rFaulted + ((faultResistance * rRem) / (faultResistance + rRem));
+      }, [relayActive, faultTap, rPerSegment, rCableTotal, faultResistance]);
+
+      // Node Voltages
+      const vA = useMemo(() => {
+        return BRIDGE_V * (rCableGnd / (R_TOP + rCableGnd));
+      }, [rCableGnd]);
+
+      const vB = useMemo(() => {
+        return BRIDGE_V * (potResistance / (R_TOP + potResistance));
+      }, [potResistance]);
+
+      const vDiff = vB - vA;
+      const vOpampOut = Math.max(0.005, Math.min(2.10, vDiff));
+
+      // Murray Loop Fault Distance
+      const estimatedDistance = useMemo(() => {
+        if (status !== 'BALANCED') return null;
+        const dist = (potResistance / rCableTotal) * cableLength;
+        return Math.max(0.0, Math.min(cableLength, dist));
+      }, [status, potResistance, rCableTotal, cableLength]);
+
+      const referenceDistance = relayActive ? faultDistanceTarget : cableLength;
+      const absError = estimatedDistance !== null ? Math.abs(estimatedDistance - referenceDistance) : null;
+      const pctError = (estimatedDistance !== null && referenceDistance > 0.001) ? (absError / referenceDistance) * 100.0 : 0.0;
+
+      // NTC Sensor Model
+      const rNtc = 10000.0 * Math.exp(3950.0 * (1.0 / (temperature + 273.15) - 1.0 / 298.15));
+      const vNtc = BRIDGE_V * (10000.0 / (rNtc + 10000.0));
+
+      // ----------------------------------------------------------------------
+      // SMOOTH, NON-FLICKERING AUTO-BALANCING ALGORITHM
+      // ----------------------------------------------------------------------
+      const handleStartBalance = useCallback(() => {
+        if (balanceTimerRef.current) clearInterval(balanceTimerRef.current);
+
+        setStatus('SEARCHING');
+        setStepProgress(0);
+
+        // Target resistance that nulls the bridge
+        const targetR = rCableGnd;
+        const startR = potResistance;
+        const totalSteps = 16;
+        let currentStep = 0;
+
+        balanceTimerRef.current = setInterval(() => {
+          currentStep++;
+          setStepProgress(currentStep);
+
+          // Smooth cosine interpolation towards null
+          const t = currentStep / totalSteps;
+          const ease = 0.5 - 0.5 * Math.cos(t * Math.PI);
+          const interpolatedR = startR + (targetR - startR) * ease;
+
+          if (currentStep >= totalSteps) {
+            clearInterval(balanceTimerRef.current);
+            balanceTimerRef.current = null;
+
+            if (precisionMode === 'hardware128') {
+              // Quantize to closest 7-bit MCP4131 step
+              const stepIdx = Math.round(128 - ((targetR - POT_RW) / POT_RAB) * 128);
+              const clamped = Math.max(0, Math.min(128, stepIdx));
+              const quantizedR = (POT_RAB * (128 - clamped) / 128.0) + POT_RW;
+              setPotResistance(quantizedR);
+            } else {
+              setPotResistance(targetR); // Exact 0.00% error
+            }
+
+            setStatus('BALANCED');
+          } else {
+            setPotResistance(interpolatedR);
+          }
+        }, 75); // 75ms smooth animation, exactly 1.2 seconds total, NO FLICKER
+      }, [rCableGnd, potResistance, precisionMode]);
+
+      const handleReset = useCallback(() => {
+        if (balanceTimerRef.current) clearInterval(balanceTimerRef.current);
+        setStatus('IDLE');
+        setStepProgress(0);
+        setPotResistance(5000.0);
+      }, []);
+
+      // Clean up timer on unmount
+      useEffect(() => {
+        return () => {
+          if (balanceTimerRef.current) clearInterval(balanceTimerRef.current);
+        };
+      }, []);
+
+      // ----------------------------------------------------------------------
+      // SCOPES & TELEMETRY RECORDING (Throttled, No DOM Thrashing)
+      // ----------------------------------------------------------------------
+      useEffect(() => {
+        const scope = scopeDataRef.current;
+        scope.vDiff.push(vDiff);
+        scope.rPot.push(potResistance);
+        scope.rCable.push(rCableGnd);
+
+        if (scope.vDiff.length > 50) {
+          scope.vDiff.shift();
+          scope.rPot.shift();
+          scope.rCable.shift();
+        }
+
+        // Draw Voltage Scope
+        if (canvasVRef.current) {
+          const cvs = canvasVRef.current;
+          const ctx = cvs.getContext('2d');
+          const w = cvs.width;
+          const h = cvs.height;
+          ctx.fillStyle = '#080c14';
+          ctx.fillRect(0, 0, w, h);
+
+          // Grid divisions (8x4 divisions)
+          ctx.strokeStyle = '#151d2d';
+          ctx.lineWidth = 1;
+          for (let x = 0; x < w; x += w / 8) {
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+          }
+          for (let y = 0; y < h; y += h / 4) {
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+          }
+
+          // Center Zero Line
+          ctx.strokeStyle = '#27354f';
+          ctx.beginPath(); ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
+
+          // Balance window (±50mV)
+          const bH = (0.05 / 2.0) * (h/2);
+          ctx.fillStyle = 'rgba(16, 185, 129, 0.15)';
+          ctx.fillRect(0, h/2 - bH, w, bH*2);
+
+          // Waveform
+          if (scope.vDiff.length >= 2) {
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            const dx = w / (50 - 1);
+            scope.vDiff.forEach((v, i) => {
+              const y = h/2 - (v / 2.0) * (h/2);
+              if (i === 0) ctx.moveTo(0, y);
+              else ctx.lineTo(i * dx, y);
+            });
+            ctx.stroke();
+          }
+        }
+
+        // Draw Resistance Scope
+        if (canvasRRef.current) {
+          const cvs = canvasRRef.current;
+          const ctx = cvs.getContext('2d');
+          const w = cvs.width;
+          const h = cvs.height;
+          ctx.fillStyle = '#080c14';
+          ctx.fillRect(0, 0, w, h);
+
+          // Grid
+          ctx.strokeStyle = '#151d2d';
+          ctx.lineWidth = 1;
+          for (let x = 0; x < w; x += w / 8) {
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+          }
+          for (let y = 0; y < h; y += h / 4) {
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+          }
+
+          if (scope.rPot.length >= 2) {
+            const dx = w / (50 - 1);
+
+            // Cable R (Amber dashed)
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            scope.rCable.forEach((r, i) => {
+              const y = h - (r / 2000.0) * h;
+              if (i === 0) ctx.moveTo(0, y);
+              else ctx.lineTo(i * dx, y);
+            });
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Pot R (Green solid)
+            ctx.strokeStyle = '#10b981';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            scope.rPot.forEach((r, i) => {
+              const y = h - (r / 2000.0) * h;
+              if (i === 0) ctx.moveTo(0, y);
+              else ctx.lineTo(i * dx, y);
+            });
+            ctx.stroke();
+          }
+        }
+      }, [vDiff, potResistance, rCableGnd]);
+
+      // Telemetry log (Recorded every second or when balanced)
+      useEffect(() => {
+        const timer = setInterval(() => {
+          const rec = {
+            time: new Date().toLocaleTimeString(),
+            vDiff: (vDiff * 1000).toFixed(1),
+            rPot: potResistance.toFixed(1),
+            rCable: rCableGnd.toFixed(1),
+            dist: estimatedDistance !== null ? estimatedDistance.toFixed(3) : '--.---',
+            ref: referenceDistance.toFixed(3),
+            err: absError !== null ? absError.toFixed(3) : '--.---',
+            status: status
+          };
+          setTelemetryRecords(prev => [rec, ...prev.slice(0, 19)]);
+        }, 800);
+        return () => clearInterval(timer);
+      }, [vDiff, potResistance, rCableGnd, estimatedDistance, referenceDistance, absError, status]);
+
+      const handleExportCSV = () => {
+        if (telemetryRecords.length === 0) return alert('No telemetry records captured yet.');
+        const headers = ['time', 'Vdiff_mV', 'R_pot_ohm', 'R_cable_ohm', 'Est_Distance_m', 'Ref_Distance_m', 'Error_m', 'Status'];
+        const rows = [headers.join(',')];
+        telemetryRecords.forEach(r => rows.push([r.time, r.vDiff, r.rPot, r.rCable, r.dist, r.ref, r.err, r.status].join(',')));
+        const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `ESP32_Cable_Fault_Log_${Date.now()}.csv`;
+        a.click();
+      };
+
+      return (
+        <div className="max-w-[1520px] mx-auto p-4 sm:p-6 space-y-5">
+          {/* Top Test Bench Instrument Banner */}
+          <header className="instrument-card rounded-xl p-4 sm:p-5 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-3">
+                <span className="text-xl text-cyan-400 font-mono">SYS-2026</span>
+                <h1 className="text-lg sm:text-xl font-bold tracking-tight text-white uppercase">
+                  ESP32 Automated Cable Fault Detection &amp; Localization
+                </h1>
+                <span className="text-[11px] font-mono px-2.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
+                  MURRAY LOOP RIG
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">
+                Precision Wheatstone Bridge Balancing &bull; MCP4131 Digital Potentiometer &bull; LM358N Signal Conditioning
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3 flex-wrap">
+              {/* Steady Status Pill */}
+              <div className="flex items-center gap-2 bg-[#090d16] border border-slate-800 px-3.5 py-1.5 rounded-lg font-mono text-xs font-semibold">
+                <span className={`led-bulb ${status === 'BALANCED' ? 'led-green-on' : status === 'SEARCHING' ? 'led-amber-on' : 'led-off'}`}></span>
+                <span className={status === 'BALANCED' ? 'text-emerald-400 font-bold' : status === 'SEARCHING' ? 'text-amber-400 font-bold' : 'text-slate-400'}>
+                  {status === 'BALANCED' ? 'BRIDGE BALANCED' : status === 'SEARCHING' ? `NULL SEEKING [${stepProgress}/16]` : 'SYSTEM IDLE'}
+                </span>
+              </div>
+
+              {/* View Tabs */}
+              <div className="flex bg-[#090d16] p-1 rounded-lg border border-slate-800">
+                <button
+                  onClick={() => setActiveTab('schematic')}
+                  className={`px-3 py-1 rounded text-xs font-medium transition ${activeTab === 'schematic' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-slate-200'}`}
+                >
+                  Circuit Schematic
+                </button>
+                <button
+                  onClick={() => setActiveTab('scopes')}
+                  className={`px-3 py-1 rounded text-xs font-medium transition ${activeTab === 'scopes' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-slate-200'}`}
+                >
+                  Oscilloscope &amp; Telemetry
+                </button>
+              </div>
+
+              <button
+                onClick={handleExportCSV}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+              >
+                Export CSV
+              </button>
+            </div>
+          </header>
+
+          {/* Precision Digital Readout Bar (OLED Style, Fixed Width, NO JITTER) */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+            {/* Meter 1: Imbalance */}
+            <div className="instrument-card rounded-xl p-3.5 space-y-1">
+              <div className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Bridge Imbalance</div>
+              <div className="text-xl font-bold font-mono text-cyan-400">
+                {(vDiff * 1000).toFixed(1)} <span className="text-xs text-slate-400 font-sans">mV</span>
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">Tolerance: &le; 50 mV</div>
+            </div>
+
+            {/* Meter 2: Calculated Fault Distance */}
+            <div className="instrument-card rounded-xl p-3.5 space-y-1 border-t-2 border-t-emerald-500">
+              <div className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Estimated Fault Lf</div>
+              <div className="text-xl font-bold font-mono text-emerald-400">
+                {status === 'BALANCED' ? `${estimatedDistance.toFixed(3)} m` : '--.--- m'}
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">Target: {referenceDistance.toFixed(3)} m</div>
+            </div>
+
+            {/* Meter 3: Accuracy */}
+            <div className="instrument-card rounded-xl p-3.5 space-y-1">
+              <div className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Detection Accuracy</div>
+              <div className="text-xl font-bold font-mono text-amber-400">
+                {status === 'BALANCED' ? `${absError.toFixed(3)} m` : '--'}
+              </div>
+              <div className="text-[11px] text-emerald-400 font-semibold font-mono">
+                {status === 'BALANCED' ? `Error: ${pctError.toFixed(2)}%` : 'Ready for balance'}
+              </div>
+            </div>
+
+            {/* Meter 4: Active Pot Resistance */}
+            <div className="instrument-card rounded-xl p-3.5 space-y-1">
+              <div className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Potentiometer Arm</div>
+              <div className="text-xl font-bold font-mono text-purple-400">
+                {potResistance.toFixed(1)} <span className="text-xs text-slate-400 font-sans">&Omega;</span>
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">Cable R: {rCableGnd.toFixed(1)} &Omega;</div>
+            </div>
+
+            {/* Meter 5: Conductor Temp */}
+            <div className="instrument-card rounded-xl p-3.5 space-y-1">
+              <div className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Conductor Temp</div>
+              <div className="text-xl font-bold font-mono text-cyan-400">
+                {temperature.toFixed(1)} <span className="text-xs text-slate-400 font-sans">&deg;C</span>
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">NTC V: {vNtc.toFixed(2)} V</div>
+            </div>
+
+            {/* Meter 6: Relay Fault State */}
+            <div className="instrument-card rounded-xl p-3.5 space-y-1">
+              <div className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Relay Path State</div>
+              <div className={`text-xl font-bold font-mono ${relayActive ? 'text-rose-400' : 'text-emerald-400'}`}>
+                {relayActive ? `TAP #${faultTap} FAULT` : 'HEALTHY LINE'}
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">
+                {relayActive ? `${(faultTap/10*cableLength).toFixed(1)}m from Node A` : 'No Short to GND'}
+              </div>
+            </div>
+          </div>
+
+          {/* Main Workspace Split */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* Left Control Deck (3.5 cols) */}
+            <div className="lg:col-span-4 xl:col-span-3 space-y-4">
+              <div className="instrument-card rounded-xl p-4 sm:p-5 space-y-4">
+                <div className="flex justify-between items-center border-b border-slate-800 pb-2.5">
+                  <h2 className="text-xs font-bold tracking-wider text-slate-300 uppercase">Test Rig Controls</h2>
+                  <span className="text-xs font-mono text-cyan-400">3.3V DC Rail</span>
+                </div>
+
+                {/* Cable Length */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs text-slate-300">
+                    <span>Cable Total Length (L)</span>
+                    <span className="font-mono text-cyan-400 font-bold">{cableLength.toFixed(1)} m</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="2.0"
+                    max="50.0"
+                    step="1.0"
+                    value={cableLength}
+                    onChange={(e) => setCableLength(parseFloat(e.target.value))}
+                    className="w-full accent-cyan-400 cursor-pointer"
+                  />
+                </div>
+
+                {/* Resistor Ladder Tap Selector (10 buttons) */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs text-slate-300">
+                    <span>Fault Location Tap</span>
+                    <span className="font-mono text-rose-400 font-bold">Tap #{faultTap} ({(faultTap/10*cableLength).toFixed(1)}m)</span>
+                  </div>
+                  <div className="grid grid-cols-5 gap-1.5">
+                    {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((tap) => (
+                      <button
+                        key={tap}
+                        onClick={() => { setFaultTap(tap); setRelayActive(true); }}
+                        className={`py-1 text-xs font-mono rounded font-semibold transition border ${
+                          faultTap === tap && relayActive
+                            ? 'bg-rose-950 text-rose-300 border-rose-500'
+                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        #{tap}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Fault Resistance */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs text-slate-300">
+                    <span>Fault Contact Resistance (Rf)</span>
+                    <span className="font-mono text-cyan-400 font-bold">{faultResistance.toFixed(1)} &Omega;</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.0"
+                    max="150.0"
+                    step="5.0"
+                    value={faultResistance}
+                    onChange={(e) => setFaultResistance(parseFloat(e.target.value))}
+                    className="w-full accent-cyan-400 cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-500">
+                    <span>0 &Omega; (Bolted Fault)</span>
+                    <span>150 &Omega; (Degraded)</span>
+                  </div>
+                </div>
+
+                {/* Cable Temperature */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs text-slate-300">
+                    <span>Conductor Temperature (T)</span>
+                    <span className="font-mono text-cyan-400 font-bold">{temperature.toFixed(1)} &deg;C</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.0"
+                    max="70.0"
+                    step="1.0"
+                    value={temperature}
+                    onChange={(e) => setTemperature(parseFloat(e.target.value))}
+                    className="w-full accent-cyan-400 cursor-pointer"
+                  />
+                </div>
+
+                {/* Material Selection */}
+                <div className="space-y-1">
+                  <label className="text-xs text-slate-300 block">Conductor Material</label>
+                  <select
+                    value={material}
+                    onChange={(e) => setMaterial(e.target.value)}
+                    className="w-full bg-[#090d16] border border-slate-700 rounded-lg p-2 text-xs font-mono text-slate-200"
+                  >
+                    <option value="copper">Annealed Copper (&alpha; = 0.00393/&deg;C)</option>
+                    <option value="aluminum">EC-Grade Aluminum (&alpha; = 0.00403/&deg;C)</option>
+                  </select>
+                </div>
+
+                {/* Balancing Precision Mode */}
+                <div className="space-y-1">
+                  <label className="text-xs text-slate-300 block">Balancing Precision Mode</label>
+                  <div className="grid grid-cols-2 gap-1.5 bg-[#090d16] p-1 rounded-lg border border-slate-800">
+                    <button
+                      onClick={() => setPrecisionMode('exact')}
+                      className={`py-1 text-xs font-semibold rounded ${precisionMode === 'exact' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'}`}
+                    >
+                      Exact (0% Err)
+                    </button>
+                    <button
+                      onClick={() => setPrecisionMode('hardware128')}
+                      className={`py-1 text-xs font-semibold rounded ${precisionMode === 'hardware128' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'}`}
+                    >
+                      MCP4131 7-Bit
+                    </button>
+                  </div>
+                </div>
+
+                {/* Action Buttons */}
+                <div className="pt-2 space-y-2">
+                  <button
+                    onClick={handleStartBalance}
+                    disabled={status === 'SEARCHING'}
+                    className="w-full py-2.5 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold rounded-lg text-xs uppercase tracking-wider transition shadow-lg shadow-cyan-500/20"
+                  >
+                    Start Auto-Balance
+                  </button>
+
+                  <button
+                    onClick={() => setRelayActive(!relayActive)}
+                    className={`w-full py-2 font-semibold rounded-lg text-xs transition border ${
+                      relayActive
+                        ? 'bg-rose-950/80 text-rose-300 border-rose-800 hover:bg-rose-900'
+                        : 'bg-emerald-950/80 text-emerald-300 border-emerald-800 hover:bg-emerald-900'
+                    }`}
+                  >
+                    {relayActive ? 'Clear Fault (Open Relay Contact)' : 'Inject Fault (Energize Relay to Tap)'}
+                  </button>
+
+                  <button
+                    onClick={handleReset}
+                    className="w-full py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 rounded-lg text-xs font-semibold transition border border-slate-700"
+                  >
+                    Reset System
+                  </button>
+                </div>
+
+                {/* Physical LED Annunciators */}
+                <div className="pt-3 border-t border-slate-800 space-y-2">
+                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">ESP32 Hardware Status LEDs</div>
+                  <div className="grid grid-cols-3 gap-2 bg-[#090d16] p-2.5 rounded-lg border border-slate-800 text-center">
+                    <div>
+                      <div className={`led-bulb mx-auto mb-1 ${status === 'BALANCED' ? 'led-green-on' : 'led-off'}`}></div>
+                      <div className="text-[9px] text-slate-400 font-mono">G21 (OK)</div>
+                    </div>
+                    <div>
+                      <div className={`led-bulb mx-auto mb-1 ${status === 'SEARCHING' ? 'led-amber-on' : 'led-off'}`}></div>
+                      <div className="text-[9px] text-slate-400 font-mono">G19 (WAIT)</div>
+                    </div>
+                    <div>
+                      <div className={`led-bulb mx-auto mb-1 ${relayActive ? 'led-red-on' : 'led-off'}`}></div>
+                      <div className="text-[9px] text-slate-400 font-mono">G22 (FAULT)</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Right Display Stage (8.5 cols) */}
+            <div className="lg:col-span-8 xl:col-span-9 space-y-4">
+              {activeTab === 'schematic' ? (
+                /* INTERACTIVE FULL CIRCUIT SCHEMATIC (Properly Fitted, Manhattan Routed, Crisp Wires) */
+                <div className="instrument-card rounded-xl p-4 sm:p-5 space-y-3">
+                  <div className="flex justify-between items-center">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                      <span>Circuit Architecture (Exact Match to Hardware Schematic)</span>
+                    </h3>
+                    <div className="flex items-center gap-4 text-xs font-mono">
+                      <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-cyan-400"></span> 3.3V Rail</span>
+                      <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-rose-500"></span> 5V Rail</span>
+                      <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-slate-500"></span> Common GND</span>
+                    </div>
+                  </div>
+
+                  {/* SVG SCHEMATIC - Centered, Generous Margins, Never Cut Off */}
+                  <div className="w-full bg-[#070b13] rounded-xl border border-slate-800/80 p-2 overflow-hidden">
+                    <svg viewBox="0 0 1080 630" className="w-full h-auto select-none">
+                      {/* ===================================================
+                          BLOCK 1: WHEATSTONE BRIDGE
+                          =================================================== */}
+                      <rect x="25" y="25" width="310" height="425" rx="8" fill="#0c1220" stroke="#f43f5e" stroke-width="1.2" stroke-dasharray="5,4" />
+                      <text x="40" y="45" fill="#f43f5e" font-size="11" font-weight="bold">1. Wheatstone Bridge (Cable + Digital Pot)</text>
+
+                      {/* 3.3V supply node */}
+                      <circle cx="170" cy="75" r="4" fill="#38bdf8" />
+                      <text x="180" y="79" fill="#38bdf8" font-size="11" font-weight="bold">3.3V Rail</text>
+                      <line x1="90" y1="75" x2="250" y2="75" stroke="#38bdf8" stroke-width="2" />
+
+                      {/* Left branch: 1k top resistor */}
+                      <line x1="90" y1="75" x2="90" y2="95" stroke="#38bdf8" stroke-width="1.8" />
+                      <rect x="80" y="95" width="20" height="34" rx="2" fill="#161f30" stroke="#38bdf8" stroke-width="1.2" />
+                      <text x="108" y="116" fill="#94a3b8" font-size="9" font-family="monospace">1 kΩ (1%)</text>
+                      <line x1="90" y1="129" x2="90" y2="155" stroke="#38bdf8" stroke-width="1.8" />
+
+                      {/* Node A (VA) */}
+                      <circle cx="90" cy="155" r="5" fill="#38bdf8" />
+                      <text x="35" y="152" fill="#38bdf8" font-size="11" font-weight="bold">Node A (VA)</text>
+                      <text x="35" y="167" fill="#67e8f9" font-size="10" font-family="monospace">
+                        VA = {vA.toFixed(3)}V
+                      </text>
+
+                      {/* 10 Resistors Ladder */}
+                      <g transform="translate(90, 180)">
+                        {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((num, i) => {
+                          const yPos = i * 22;
+                          const isFaulted = relayActive && num <= faultTap;
+                          const isTap = num === faultTap;
+                          return (
+                            <g key={num} onClick={() => { setFaultTap(num); setRelayActive(true); }} className="cursor-pointer">
+                              <line x1="0" y1={yPos} x2="0" y2={yPos + 5} stroke={isFaulted ? '#f43f5e' : '#64748b'} stroke-width="1.8" />
+                              <rect
+                                x="-12"
+                                y={yPos + 5}
+                                width="24"
+                                height="13"
+                                rx="2"
+                                fill={isFaulted ? '#3b0d1a' : '#111827'}
+                                stroke={isTap ? '#f43f5e' : isFaulted ? '#e11d48' : '#334155'}
+                                stroke-width={isTap ? 1.8 : 1}
+                              />
+                              <text x="-4" y={yPos + 15} fill={isFaulted ? '#fda4af' : '#64748b'} font-size="7.5" font-family="monospace">
+                                {num}
+                              </text>
+                              <text x="16" y={yPos + 15} fill="#64748b" font-size="8">100Ω</text>
+                              {isTap && relayActive && (
+                                <circle cx="0" cy={yPos + 18} r="3.5" fill="#f43f5e" />
+                              )}
+                            </g>
+                          );
+                        })}
+                      </g>
+
+                      {/* Cable Ladder Ground */}
+                      <line x1="90" y1="400" x2="90" y2="420" stroke="#64748b" stroke-width="1.8" />
+                      <line x1="80" y1="420" x2="100" y2="420" stroke="#64748b" stroke-width="1.8" />
+                      <line x1="84" y1="424" x2="96" y2="424" stroke="#64748b" stroke-width="1.5" />
+                      <text x="105" y="424" fill="#64748b" font-size="8">GND</text>
+
+                      {/* Right branch: 1k top resistor */}
+                      <line x1="250" y1="75" x2="250" y2="95" stroke="#38bdf8" stroke-width="1.8" />
+                      <rect x="240" y="95" width="20" height="34" rx="2" fill="#161f30" stroke="#38bdf8" stroke-width="1.2" />
+                      <text x="268" y="116" fill="#94a3b8" font-size="9" font-family="monospace">1 kΩ (1%)</text>
+                      <line x1="250" y1="129" x2="250" y2="155" stroke="#38bdf8" stroke-width="1.8" />
+
+                      {/* Node B (VB) */}
+                      <circle cx="250" cy="155" r="5" fill="#f43f5e" />
+                      <text x="262" y="152" fill="#f43f5e" font-size="11" font-weight="bold">Node B (VB)</text>
+                      <text x="262" y="167" fill="#fda4af" font-size="10" font-family="monospace">
+                        VB = {vB.toFixed(3)}V
+                      </text>
+
+                      {/* Wire from Node B to MCP4131 Pin 5 (POA) */}
+                      <path d="M 250 155 L 250 240 L 385 240" fill="none" stroke="#10b981" stroke-width="1.8" />
+                      <text x="256" y="234" fill="#10b981" font-size="8.5">POA (Pin 5)</text>
+
+                      {/* Wire from MCP4131 Wiper Pin 6 to GND */}
+                      <path d="M 385 260 L 250 260 L 250 400" fill="none" stroke="#64748b" stroke-width="1.8" />
+                      <line x1="250" y1="400" x2="250" y2="420" stroke="#64748b" stroke-width="1.8" />
+                      <line x1="240" y1="420" x2="260" y2="420" stroke="#64748b" stroke-width="1.8" />
+                      <text x="265" y="424" fill="#64748b" font-size="8">GND</text>
+
+                      {/* ===================================================
+                          BLOCK 2: MCP4131 DIGITAL POTENTIOMETER
+                          =================================================== */}
+                      <rect x="365" y="175" width="160" height="150" rx="8" fill="#0c1220" stroke="#10b981" stroke-width="1.2" stroke-dasharray="5,4" />
+                      <text x="375" y="195" fill="#10b981" font-size="10.5" font-weight="bold">2. MCP4131 (10 kΩ)</text>
+
+                      {/* DIP-8 IC Body */}
+                      <rect x="400" y="210" width="85" height="95" rx="3" fill="#050811" stroke="#334155" stroke-width="1.5" />
+                      <circle cx="442" cy="210" r="4.5" fill="#0c1220" stroke="#334155" />
+                      <text x="414" y="250" fill="#f1f5f9" font-size="9.5" font-weight="bold" font-family="monospace">MCP4131</text>
+                      <text x="418" y="267" fill="#10b981" font-size="9" font-family="monospace">{potResistance.toFixed(0)} Ω</text>
+
+                      {/* Pin labels */}
+                      <text x="382" y="225" fill="#f59e0b" font-size="7.5">1 CS</text>
+                      <text x="377" y="247" fill="#10b981" font-size="7.5">2 SCK</text>
+                      <text x="377" y="269" fill="#38bdf8" font-size="7.5">3 SDI</text>
+                      <text x="377" y="291" fill="#64748b" font-size="7.5">4 GND</text>
+
+                      <text x="492" y="225" fill="#38bdf8" font-size="7.5">8 VDD</text>
+                      <text x="492" y="247" fill="#64748b" font-size="7.5">7 NC</text>
+                      <text x="492" y="269" fill="#64748b" font-size="7.5">6 WIP</text>
+                      <text x="492" y="291" fill="#10b981" font-size="7.5">5 POA</text>
+
+                      {/* ===================================================
+                          BLOCK 3: 5V RELAY MODULE
+                          =================================================== */}
+                      <rect x="25" y="470" width="310" height="135" rx="8" fill="#0c1220" stroke="#a855f7" stroke-width="1.2" stroke-dasharray="5,4" />
+                      <text x="40" y="490" fill="#a855f7" font-size="10.5" font-weight="bold">3. Fault Injection (5V Relay Module)</text>
+
+                      {/* Relay Body */}
+                      <rect x="140" y="505" width="100" height="85" rx="5" fill="#171330" stroke="#6366f1" stroke-width="1.2" />
+                      <text x="160" y="528" fill="#c7d2fe" font-size="9.5" font-weight="bold">5V Relay</text>
+                      <text x="156" y="543" fill={relayActive ? '#f43f5e' : '#10b981'} font-size="8.5" font-family="monospace">
+                        {relayActive ? 'ENERGIZED' : 'DE-ENERGIZED'}
+                      </text>
+                      <text x="148" y="562" fill="#94a3b8" font-size="7.5">COM (GND)</text>
+                      <text x="148" y="578" fill="#f43f5e" font-size="7.5">NO (Tap {faultTap})</text>
+
+                      {/* Purple Wire from Relay NO to Ladder Tap */}
+                      {relayActive && (
+                        <path
+                          d={`M 140 575 C 105 575, 70 ${198 + faultTap * 22}, 90 ${198 + faultTap * 22}`}
+                          fill="none"
+                          stroke="#c084fc"
+                          stroke-width="2"
+                          stroke-dasharray="5,3"
+                        />
+                      )}
+
+                      {/* Control Wire from ESP32 GPIO 26 */}
+                      <path d="M 240 545 L 565 545 L 565 385" fill="none" stroke="#f97316" stroke-width="1.5" />
+                      <text x="320" y="540" fill="#f97316" font-size="8.5">GPIO 26 (Relay IN)</text>
+
+                      {/* ===================================================
+                          BLOCK 4: SIGNAL CONDITIONING (LM358N)
+                          =================================================== */}
+                      <rect x="690" y="25" width="365" height="210" rx="8" fill="#0c1220" stroke="#38bdf8" stroke-width="1.2" stroke-dasharray="5,4" />
+                      <text x="705" y="47" fill="#38bdf8" font-size="11" font-weight="bold">4. Signal Conditioning (LM358N Difference Amp)</text>
+
+                      {/* Op-amp triangle */}
+                      <polygon points="790,105 790,185 870,145" fill="#141d2e" stroke="#38bdf8" stroke-width="1.8" />
+                      <text x="798" y="128" fill="#f43f5e" font-size="13" font-weight="bold">-</text>
+                      <text x="798" y="170" fill="#38bdf8" font-size="13" font-weight="bold">+</text>
+                      <text x="810" y="149" fill="#94a3b8" font-size="9">LM358</text>
+
+                      {/* Wire from Node A to Pin 2 (-) */}
+                      <path d="M 90 155 L 90 60 L 670 60 L 670 125 L 755 125" fill="none" stroke="#38bdf8" stroke-width="1.5" />
+                      <rect x="745" y="117" width="22" height="15" fill="#080c14" stroke="#38bdf8" stroke-width="1" />
+                      <text x="748" y="128" fill="#67e8f9" font-size="7">10k</text>
+                      <line x1="767" y1="125" x2="790" y2="125" stroke="#38bdf8" stroke-width="1.5" />
+
+                      {/* Wire from Node B to Pin 3 (+) */}
+                      <path d="M 250 155 L 250 80 L 680 80 L 680 165 L 755 165" fill="none" stroke="#f43f5e" stroke-width="1.5" />
+                      <rect x="745" y="157" width="22" height="15" fill="#080c14" stroke="#f43f5e" stroke-width="1" />
+                      <text x="748" y="168" fill="#fda4af" font-size="7">10k</text>
+                      <line x1="767" y1="165" x2="790" y2="165" stroke="#f43f5e" stroke-width="1.5" />
+
+                      {/* Output to GPIO 34 */}
+                      <path d="M 870 145 L 905 145 L 905 270 L 625 270" fill="none" stroke="#10b981" stroke-width="1.8" />
+                      <circle cx="870" cy="145" r="3.5" fill="#10b981" />
+                      <text x="880" y="138" fill="#10b981" font-size="9.5" font-weight="bold">
+                        Vout = {(vDiff * 1000).toFixed(0)}mV
+                      </text>
+                      <text x="635" y="265" fill="#10b981" font-size="8.5">GPIO 34 (ADC Vout)</text>
+
+                      {/* ===================================================
+                          BLOCK 5: THERMAL SENSOR (NTC)
+                          =================================================== */}
+                      <rect x="690" y="250" width="175" height="165" rx="8" fill="#0c1220" stroke="#f59e0b" stroke-width="1.2" stroke-dasharray="5,4" />
+                      <text x="705" y="270" fill="#f59e0b" font-size="10.5" font-weight="bold">5. Thermal Sensor (NTC)</text>
+
+                      <circle cx="770" cy="290" r="3" fill="#38bdf8" />
+                      <text x="780" y="293" fill="#38bdf8" font-size="8">3.3V</text>
+                      <line x1="770" y1="290" x2="770" y2="305" stroke="#38bdf8" stroke-width="1.5" />
+
+                      <rect x="760" y="305" width="20" height="24" rx="2" fill="#161f30" stroke="#f59e0b" stroke-width="1.2" />
+                      <text x="785" y="320" fill="#f59e0b" font-size="7.5">NTC 10k</text>
+
+                      <circle cx="770" cy="340" r="3.5" fill="#f59e0b" />
+                      <path d="M 770 340 L 625 340" fill="none" stroke="#f59e0b" stroke-width="1.5" />
+                      <text x="630" y="335" fill="#f59e0b" font-size="8.5">GPIO 35 (ADC NTC)</text>
+
+                      <line x1="770" y1="340" x2="770" y2="360" stroke="#94a3b8" stroke-width="1.5" />
+                      <rect x="760" y="360" width="20" height="22" rx="2" fill="#080c14" stroke="#94a3b8" stroke-width="1" />
+                      <text x="785" y="375" fill="#94a3b8" font-size="7.5">10 kΩ</text>
+                      <line x1="770" y1="382" x2="770" y2="400" stroke="#64748b" stroke-width="1.5" />
+
+                      {/* ===================================================
+                          BLOCK 6: STATUS LEDS
+                          =================================================== */}
+                      <rect x="880" y="250" width="175" height="165" rx="8" fill="#0c1220" stroke="#a855f7" stroke-width="1.2" stroke-dasharray="5,4" />
+                      <text x="895" y="270" fill="#a855f7" font-size="10.5" font-weight="bold">6. Status LEDs</text>
+
+                      <circle cx="915" cy="305" r="6" fill={status === 'BALANCED' ? '#10b981' : '#1e293b'} stroke="#10b981" stroke-width="1.2" />
+                      <text x="930" y="309" fill="#10b981" font-size="8" font-weight="bold">G21 (OK)</text>
+
+                      <circle cx="915" cy="340" r="6" fill={relayActive ? '#ef4444' : '#1e293b'} stroke="#ef4444" stroke-width="1.2" />
+                      <text x="930" y="344" fill="#ef4444" font-size="8" font-weight="bold">G22 (FAULT)</text>
+
+                      <circle cx="915" cy="375" r="6" fill={status === 'SEARCHING' ? '#f59e0b' : '#1e293b'} stroke="#f59e0b" stroke-width="1.2" />
+                      <text x="930" y="379" fill="#f59e0b" font-size="8" font-weight="bold">G19 (WAIT)</text>
+
+                      {/* ===================================================
+                          BLOCK 7: ESP32 DEVELOPMENT BOARD
+                          =================================================== */}
+                      <g transform="translate(535, 25)">
+                        <rect x="0" y="0" width="115" height="425" rx="8" fill="#080c14" stroke="#334155" stroke-width="2" />
+                        <rect x="25" y="35" width="65" height="90" rx="3" fill="#161f30" stroke="#475569" stroke-width="1" />
+                        <text x="35" y="70" fill="#94a3b8" font-size="9" font-family="monospace">ESP32</text>
+                        <text x="32" y="85" fill="#64748b" font-size="7" font-family="monospace">WROOM-32</text>
+                        <text x="18" y="22" fill="#e2e8f0" font-size="9.5" font-weight="bold">ESP32 Dev Board</text>
+
+                        {/* Left Pin Header */}
+                        <g font-size="7" font-family="monospace">
+                          <text x="8" y="160" fill="#f59e0b">G5 (CS)</text>
+                          <text x="8" y="180" fill="#10b981">G18 (SCK)</text>
+                          <text x="8" y="200" fill="#38bdf8">G23 (SDI)</text>
+                          <text x="8" y="270" fill="#10b981">G21 (LED)</text>
+                          <text x="8" y="290" fill="#ef4444">G22 (LED)</text>
+                          <text x="8" y="310" fill="#f59e0b">G19 (LED)</text>
+                          <text x="8" y="360" fill="#f97316">G26 (RLY)</text>
+                        </g>
+
+                        {/* Right Pin Header */}
+                        <g font-size="7" font-family="monospace" text-anchor="end">
+                          <text x="107" y="250" fill="#10b981">G34 (ADC)</text>
+                          <text x="107" y="320" fill="#f59e0b">G35 (ADC)</text>
+                          <text x="107" y="380" fill="#38bdf8">3.3V OUT</text>
+                          <text x="107" y="400" fill="#ef4444">VIN (5V)</text>
+                          <text x="107" y="415" fill="#64748b">GND</text>
+                        </g>
+                      </g>
+
+                      {/* SPI Bus Wires: GPIO 5, 18, 23 to MCP4131 */}
+                      <path d="M 535 185 L 400 185 L 400 225" fill="none" stroke="#f59e0b" stroke-width="1.4" className={status === 'SEARCHING' ? 'wire-pulse' : ''} />
+                      <path d="M 535 205 L 415 205 L 415 245" fill="none" stroke="#10b981" stroke-width="1.4" className={status === 'SEARCHING' ? 'wire-pulse' : ''} />
+                      <path d="M 535 225 L 430 225 L 430 265" fill="none" stroke="#38bdf8" stroke-width="1.4" className={status === 'SEARCHING' ? 'wire-pulse' : ''} />
+
+                      {/* Bottom Power Rails */}
+                      <rect x="25" y="612" width="1030" height="15" rx="3" fill="#04070e" stroke="#1e293b" />
+                      <line x1="40" y1="616" x2="1040" y2="616" stroke="#ef4444" stroke-width="1.8" />
+                      <text x="45" y="625" fill="#ef4444" font-size="7" font-family="monospace">5V RAIL (Relay Only)</text>
+
+                      <line x1="40" y1="620" x2="1040" y2="620" stroke="#38bdf8" stroke-width="1.8" />
+                      <text x="340" y="625" fill="#38bdf8" font-size="7" font-family="monospace">3.3V RAIL (Sensors, Bridge, LM358, MCP4131)</text>
+
+                      <line x1="40" y1="624" x2="1040" y2="624" stroke="#64748b" stroke-width="1.8" />
+                      <text x="680" y="625" fill="#94a3b8" font-size="7" font-family="monospace">COMMON GND BUS</text>
+                    </svg>
+                  </div>
+                </div>
+              ) : (
+                /* LABORATORY OSCILLOSCOPES & TELEMETRY VIEW */
+                <div className="space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Scope 1 */}
+                    <div className="instrument-card rounded-xl p-4 space-y-2">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="font-bold uppercase tracking-wider text-slate-300">Channel 1: Bridge Error Vdiff</span>
+                        <span className="text-cyan-400 font-mono">Null Band: &plusmn;50 mV</span>
+                      </div>
+                      <canvas ref={canvasVRef} width="450" height="175" className="w-full h-44 rounded-lg border border-slate-800"></canvas>
+                      <div className="flex justify-between text-[11px] text-slate-500 font-mono">
+                        <span>-2.0 V</span>
+                        <span>0.0 V (Equilibrium)</span>
+                        <span>+2.0 V</span>
+                      </div>
+                    </div>
+
+                    {/* Scope 2 */}
+                    <div className="instrument-card rounded-xl p-4 space-y-2">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="font-bold uppercase tracking-wider text-slate-300">Channel 2: Pot R (Green) vs Cable (Amber)</span>
+                        <span className="text-emerald-400 font-mono">0 - 2000 &Omega;</span>
+                      </div>
+                      <canvas ref={canvasRRef} width="450" height="175" className="w-full h-44 rounded-lg border border-slate-800"></canvas>
+                      <div className="flex justify-between text-[11px] text-slate-500 font-mono">
+                        <span>0 &Omega;</span>
+                        <span>1000 &Omega;</span>
+                        <span>2000 &Omega;</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Telemetry Log */}
+                  <div className="instrument-card rounded-xl p-4 space-y-2">
+                    <div className="flex justify-between items-center">
+                      <h3 className="text-xs font-bold tracking-wider text-slate-300 uppercase">
+                        Real-Time CSV Telemetry Records (115200 Baud)
+                      </h3>
+                      <span className="text-xs font-mono text-cyan-400">Fixed Sampling Rate</span>
+                    </div>
+
+                    <div className="max-h-56 overflow-y-auto rounded-lg border border-slate-800">
+                      <table className="w-full text-left font-mono text-xs">
+                        <thead className="bg-[#090d16] text-slate-400 sticky top-0 border-b border-slate-800">
+                          <tr>
+                            <th className="p-2">Time</th>
+                            <th className="p-2">Vdiff (mV)</th>
+                            <th className="p-2">R_pot (&Omega;)</th>
+                            <th className="p-2">R_cable (&Omega;)</th>
+                            <th className="p-2">Est Lf (m)</th>
+                            <th className="p-2">Ref (m)</th>
+                            <th className="p-2">Error (m)</th>
+                            <th className="p-2">Status</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60">
+                          {telemetryRecords.map((row, idx) => (
+                            <tr key={idx} className="hover:bg-slate-800/30">
+                              <td className="p-2 text-slate-400">{row.time}</td>
+                              <td className="p-2 text-cyan-400">{row.vDiff}</td>
+                              <td className="p-2 text-emerald-400">{row.rPot}</td>
+                              <td className="p-2 text-amber-400">{row.rCable}</td>
+                              <td className="p-2 text-white font-bold">{row.dist}</td>
+                              <td className="p-2 text-slate-300">{row.ref}</td>
+                              <td className="p-2 text-rose-400">{row.err}</td>
+                              <td className="p-2">
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                  row.status === 'BALANCED' ? 'bg-emerald-950 text-emerald-400' :
+                                  row.status === 'SEARCHING' ? 'bg-amber-950 text-amber-400' : 'bg-slate-800 text-slate-400'
+                                }`}>
+                                  {row.status}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Murray-Loop Physics Reconciliation Card */}
+              <div className="instrument-card rounded-xl p-4 space-y-2">
+                <div className="flex justify-between items-center border-b border-slate-800 pb-2">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                    Murray-Loop Equation &amp; Syllabus Alignment (Presentation Slide 11)
+                  </h4>
+                  <span className="text-xs font-mono text-emerald-400 font-bold">100% Mathematical Convergence</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-400">
+                  <div className="instrument-display p-3 rounded-lg space-y-1">
+                    <span className="font-bold text-cyan-400 font-mono">1. Hardware Ladder Demonstrator Formula:</span>
+                    <p className="font-mono text-slate-200">Lf = [ R_pot / R_cable(T) ] &times; L</p>
+                    <p className="text-[11px] text-slate-400">
+                      Evaluated from null condition (VA = VB). For Tap #{faultTap} on {cableLength.toFixed(1)}m cable:
+                      <strong className="text-emerald-400 ml-1">
+                        Lf = ({potResistance.toFixed(1)} / {rCableTotal.toFixed(1)}) &times; {cableLength.toFixed(1)} = {estimatedDistance !== null ? estimatedDistance.toFixed(3) : faultDistanceTarget.toFixed(3)} m
+                      </strong>
+                    </p>
+                  </div>
+
+                  <div className="instrument-display p-3 rounded-lg space-y-1">
+                    <span className="font-bold text-purple-400 font-mono">2. Classical Two-Core Loop Formula (Slide 11):</span>
+                    <p className="font-mono text-slate-200">Lf = (2L &times; R2) / (R1 + R2)</p>
+                    <p className="text-[11px] text-slate-400">
+                      Where R2 = faulted conductor arm and R1 = sound return arm (R1 + R2 = 2 &times; R_cable).
+                      Both formulas are <strong className="text-emerald-400">mathematically identical</strong>.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>

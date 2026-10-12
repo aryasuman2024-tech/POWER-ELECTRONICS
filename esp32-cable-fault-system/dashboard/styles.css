@@ -1,0 +1,516 @@
+/* ==========================================================================
+   ESP32 AUTOMATED CABLE FAULT LOCALIZATION - VIRTUAL INSTRUMENT STYLES
+   ========================================================================== */
+
+:root {
+  --bg-primary: #0b0f19;
+  --bg-secondary: #131b2e;
+  --bg-card: #1c2640;
+  --bg-input: #0f172a;
+  --border-color: #2b395b;
+  --border-glow: rgba(56, 189, 248, 0.25);
+  
+  --text-main: #f1f5f9;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+
+  --accent-cyan: #38bdf8;
+  --accent-blue: #3b82f6;
+  --accent-green: #10b981;
+  --accent-amber: #f59e0b;
+  --accent-red: #ef4444;
+  --accent-purple: #a855f7;
+
+  --font-mono: 'Consolas', 'Monaco', 'Courier New', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  padding: 16px;
+  min-height: 100vh;
+}
+
+.instrument-container {
+  max-width: 1440px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Header */
+.instrument-header {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.header-title h1 {
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--text-main);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.header-title .tag {
+  font-size: 0.75rem;
+  background: rgba(56, 189, 248, 0.15);
+  color: var(--accent-cyan);
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  font-family: var(--font-mono);
+}
+
+.header-subtitle {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Status Annunciator Pill */
+.status-pill {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+  padding: 6px 14px;
+  border-radius: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+}
+
+.status-pill.idle {
+  background: #1e293b;
+  color: var(--text-muted);
+  border-color: #334155;
+}
+
+.status-pill.searching {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--accent-amber);
+  border-color: var(--accent-amber);
+  animation: pulse 1.5s infinite;
+}
+
+.status-pill.balanced {
+  background: rgba(16, 185, 129, 0.15);
+  color: var(--accent-green);
+  border-color: var(--accent-green);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.3);
+}
+
+.status-pill.error {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--accent-red);
+  border-color: var(--accent-red);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* Main Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 320px 1fr 340px;
+  gap: 16px;
+}
+
+@media (max-width: 1200px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Cards */
+.panel-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.panel-card.accent-border {
+  border-top: 3px solid var(--accent-cyan);
+}
+
+.card-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding-bottom: 8px;
+}
+
+/* Form Controls */
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.control-label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+}
+
+.control-label .val {
+  font-family: var(--font-mono);
+  color: var(--accent-cyan);
+  font-weight: 600;
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent-cyan);
+}
+
+input[type="number"], select {
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+}
+
+input[type="number"]:focus, select:focus {
+  border-color: var(--accent-cyan);
+  outline: none;
+}
+
+/* Buttons */
+.btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 8px 14px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.btn:hover {
+  background: rgba(56, 189, 248, 0.1);
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+}
+
+.btn.btn-primary {
+  background: var(--accent-cyan);
+  color: #0b0f19;
+  border-color: var(--accent-cyan);
+}
+
+.btn.btn-primary:hover {
+  background: #7dd3fc;
+}
+
+.btn.btn-danger {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: var(--accent-red);
+  color: var(--accent-red);
+}
+
+.btn.btn-danger:hover {
+  background: var(--accent-red);
+  color: #fff;
+}
+
+.btn.btn-success {
+  background: rgba(16, 185, 129, 0.15);
+  border-color: var(--accent-green);
+  color: var(--accent-green);
+}
+
+.btn.btn-success:hover {
+  background: var(--accent-green);
+  color: #fff;
+}
+
+/* Digital Meters Grid */
+.meters-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.digital-meter {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+  overflow: hidden;
+}
+
+.meter-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+.meter-value {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--accent-cyan);
+}
+
+.meter-value.green { color: var(--accent-green); }
+.meter-value.amber { color: var(--accent-amber); }
+.meter-value.red   { color: var(--accent-red); }
+
+.meter-unit {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-left: 4px;
+}
+
+.meter-sub {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+/* Interactive Schematic / Cable Visualizer */
+.cable-visualizer-container {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cable-line-display {
+  display: flex;
+  align-items: center;
+  position: relative;
+  height: 56px;
+  background: #0f172a;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  padding: 0 16px;
+  margin: 10px 0;
+}
+
+.cable-track {
+  width: 100%;
+  height: 8px;
+  background: #334155;
+  border-radius: 4px;
+  position: relative;
+}
+
+.cable-track-faulted {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-red));
+  border-radius: 4px 0 0 4px;
+  position: absolute;
+  top: 0;
+  left: 0;
+  transition: width 0.3s ease;
+}
+
+.cable-pin {
+  position: absolute;
+  top: -12px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transition: left 0.3s ease;
+}
+
+.pin-marker {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent-red);
+  box-shadow: 0 0 10px var(--accent-red);
+  border: 2px solid #fff;
+}
+
+.pin-label {
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  color: var(--accent-red);
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+/* Oscilloscope / Charts Section */
+.charts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .charts-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.chart-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chart-card header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+canvas.scope-canvas {
+  width: 100%;
+  height: 160px;
+  background: #090d16;
+  border-radius: 4px;
+  border: 1px solid #1e293b;
+}
+
+/* Telemetry Table */
+.table-container {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+table.telemetry-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-align: left;
+}
+
+table.telemetry-table th {
+  background: #1e293b;
+  color: var(--text-muted);
+  padding: 6px 10px;
+  position: sticky;
+  top: 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+table.telemetry-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+table.telemetry-table tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* LED Indicator Bank */
+.led-bank {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-around;
+  padding: 10px;
+  background: var(--bg-card);
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+}
+
+.led-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.led-lamp {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #2a3449;
+  border: 2px solid #1a2233;
+  transition: all 0.2s ease;
+}
+
+.led-lamp.green.on {
+  background: #10b981;
+  box-shadow: 0 0 14px #10b981;
+  border-color: #6ee7b7;
+}
+
+.led-lamp.red.on {
+  background: #ef4444;
+  box-shadow: 0 0 14px #ef4444;
+  border-color: #fca5a5;
+}
+
+.led-lamp.amber.on {
+  background: #f59e0b;
+  box-shadow: 0 0 14px #f59e0b;
+  border-color: #fde68a;
+}
+
+.led-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
